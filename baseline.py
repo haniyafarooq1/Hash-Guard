@@ -4,6 +4,8 @@ import hashlib
 import json
 import tempfile
 
+from baseline_security import sign_baseline, verify_baseline
+
 
 # 1. Find all files inside a folder and its subfolders
 def get_files(folder_path):
@@ -11,8 +13,7 @@ def get_files(folder_path):
 
     for root, directories, filenames in os.walk(folder_path):
         for filename in filenames:
-            file_path = os.path.join(root, filename)
-            files.append(file_path)
+            files.append(os.path.join(root, filename))
 
     return files
 
@@ -51,12 +52,13 @@ def build_baseline(folder_path):
         except (PermissionError, OSError):
             failed_files.append(file_path)
 
-    # Do not save an incomplete baseline
     if failed_files:
         print("Error: Some files could not be accessed.")
         print("Baseline was not saved.")
+
         for file_path in failed_files:
             print(file_path)
+
         return None
 
     return baseline
@@ -72,7 +74,6 @@ def create_baseline(folder_path, baseline_file="baseline.json"):
     temporary_file = None
 
     try:
-        # Create temporary file in the same folder
         target_folder = os.path.dirname(os.path.abspath(baseline_file))
 
         with tempfile.NamedTemporaryFile(
@@ -84,11 +85,16 @@ def create_baseline(folder_path, baseline_file="baseline.json"):
             temporary_file = file.name
             json.dump(baseline, file, indent=4)
 
-        # Replace old baseline only after successful saving
         os.replace(temporary_file, baseline_file)
+
+        # Sign the baseline after saving it
+        if not sign_baseline(baseline_file):
+            print("Error: Could not authenticate baseline.")
+            return False
 
         print("Baseline created successfully!")
         print("Total files saved:", len(baseline))
+
         return True
 
     except OSError as error:
@@ -100,8 +106,14 @@ def create_baseline(folder_path, baseline_file="baseline.json"):
         return False
 
 
-# 5. Load and validate an existing baseline
+# 5. Load and authenticate an existing baseline
 def load_baseline(baseline_file="baseline.json"):
+
+    # Verify authenticity before trusting the baseline
+    if not verify_baseline(baseline_file):
+        print("Baseline rejected for security reasons.")
+        return {}
+
     try:
         with open(baseline_file, "r", encoding="utf-8") as file:
             baseline = json.load(file)

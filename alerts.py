@@ -8,7 +8,9 @@ Key behaviours required by the TRD:
 * Alert severities are configurable at runtime (FR-08) via
   :func:`set_severity_config` instead of being hard-coded in the frontend.
 * ``baseline_unavailable`` always produces a CRITICAL alert and is never
-  reported as a clean scan (FR-09).
+  reported as a clean scan (FR-09).  The severity of baseline
+  verification / authentication failures is PINNED to ``critical`` and
+  cannot be lowered through the configurable severity settings.
 * Errors produce system alerts, and never discard valid findings (FR-10).
 * The ``suspicious_files`` array is the single primary source for
   suspicious-file alerts; a file that also appears in
@@ -55,6 +57,15 @@ DEFAULT_SEVERITY_CONFIG = {
     "scan_error": "medium",
 }
 
+# Severity rules that are PINNED and can never be changed through
+# set_severity_config(): a baseline that cannot be loaded or
+# authenticated means the integrity of the whole monitored directory is
+# unknown, so the alert must always stay CRITICAL (FR-09) regardless of
+# any runtime configuration.
+PINNED_SEVERITY_RULES = {
+    "baseline_unavailable": "critical",
+}
+
 _severity_config = dict(DEFAULT_SEVERITY_CONFIG)
 
 
@@ -64,6 +75,11 @@ def set_severity_config(overrides):
     Example::
 
         set_severity_config({"file_added": "low", "file_modified": "critical"})
+
+    Pinned rules (see :data:`PINNED_SEVERITY_RULES`) cannot be changed:
+    baseline verification / authentication failures must remain
+    ``critical``, so trying to lower (or otherwise change) their
+    severity raises :class:`ValueError`.
     """
     if not isinstance(overrides, dict):
         raise ValueError("severity overrides must be a dictionary")
@@ -80,6 +96,13 @@ def set_severity_config(overrides):
                     value, ", ".join(SEVERITIES)
                 )
             )
+        pinned = PINNED_SEVERITY_RULES.get(key)
+        if pinned is not None and value != pinned:
+            raise ValueError(
+                "The severity of '{}' is fixed at '{}' and cannot be "
+                "changed: baseline verification / authentication failures "
+                "must always stay critical (FR-09).".format(key, pinned)
+            )
     _severity_config.update(overrides)
 
 
@@ -92,6 +115,19 @@ def reset_severity_config():
     """Restore the default severity configuration."""
     _severity_config.clear()
     _severity_config.update(DEFAULT_SEVERITY_CONFIG)
+
+
+def _effective_severity(rule, config):
+    """Configured severity for a rule with the pinned floor applied.
+
+    Defense in depth: even if the in-memory configuration somehow held
+    a lower value for a pinned rule (e.g. direct dictionary mutation),
+    the pinned severity is what is actually used for the alert.
+    """
+    pinned = PINNED_SEVERITY_RULES.get(rule)
+    if pinned is not None:
+        return pinned
+    return config.get(rule, DEFAULT_SEVERITY_CONFIG[rule])
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +257,10 @@ def generate_alerts(integrity_result, suspicious_result, scan_id):
 
     candidates = []
 
-    # FR-09: baseline security alert, critical by default.
+    # FR-09: baseline security alert (critical by default).  The
+    # severity is pinned: a baseline that cannot be loaded or
+    # authenticated can never be alerted below critical, regardless of
+    # the runtime severity configuration.
     if integrity_status == "baseline_unavailable":
         candidates.append({
             "dedupe_key": "baseline_unavailable",
@@ -232,7 +271,7 @@ def generate_alerts(integrity_result, suspicious_result, scan_id):
                 "baseline file, signature and secret-key availability."
             ),
             "category": "baseline",
-            "severity": config["baseline_unavailable"],
+            "severity": _effective_severity("baseline_unavailable", config),
             "file_path": None,
         })
 

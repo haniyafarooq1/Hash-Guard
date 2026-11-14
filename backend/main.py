@@ -60,7 +60,6 @@ def root():
     return {
         "service": "Hash Guard API",
         "version": "1.0.0",
-        "database": str(database.get_database_path()),
         "docs": "/docs",
     }
 

@@ -477,6 +477,150 @@ class TestTimestampsAndAssessments(HashGuardTestCase):
         self.assertEqual(history["items"][0]["overall_status"], "clean")
 
 
+class TestOverallStatusRequiresBothStages(HashGuardTestCase):
+    """A scan is only clean when BOTH detection stages ran and finished."""
+
+    def test_missing_suspicious_result_is_never_clean(self):
+        """No suspicious result -> the scan is incomplete, never clean."""
+        self.assertEqual(
+            derive_overall_status(make_integrity_result(), None),
+            "incomplete",
+        )
+
+    def test_not_started_suspicious_status_is_never_clean(self):
+        self.assertEqual(
+            derive_overall_status(
+                make_integrity_result(),
+                make_suspicious_result(status="not_started"),
+            ),
+            "incomplete",
+        )
+
+    def test_failed_suspicious_status_is_never_clean(self):
+        """A crashed stage outranks its own error entries and findings."""
+        self.assertEqual(
+            derive_overall_status(
+                make_integrity_result(),
+                make_suspicious_result(
+                    status="failed",
+                    errors=[{"path": "p", "message": "boom"}],
+                ),
+            ),
+            "incomplete",
+        )
+
+    def test_unknown_suspicious_status_is_never_clean(self):
+        self.assertEqual(
+            derive_overall_status(
+                make_integrity_result(),
+                make_suspicious_result(status="something_new"),
+            ),
+            "incomplete",
+        )
+
+    def test_missing_suspicious_status_key_is_never_clean(self):
+        suspicious = make_suspicious_result()
+        del suspicious["status"]
+        self.assertEqual(
+            derive_overall_status(make_integrity_result(), suspicious),
+            "incomplete",
+        )
+
+    def test_failed_integrity_status_is_never_clean(self):
+        self.assertEqual(
+            derive_overall_status(
+                make_integrity_result(
+                    status="failed",
+                    errors=[{"path": "/tmp/x", "message": "crash"}],
+                ),
+                make_suspicious_result(),
+            ),
+            "incomplete",
+        )
+
+    def test_findings_with_missing_suspicious_stage_stay_incomplete(self):
+        """Real findings do not mask the fact that the scan did not finish."""
+        self.assertEqual(
+            derive_overall_status(
+                make_integrity_result(
+                    modified=[{
+                        "path": "a.txt",
+                        "baseline_hash": "1",
+                        "current_hash": "2",
+                    }]
+                ),
+                None,
+            ),
+            "incomplete",
+        )
+
+    def test_completed_with_errors_suspicious_is_not_incomplete(self):
+        """A stage that ran and finished with errors keeps its meaning."""
+        self.assertEqual(
+            derive_overall_status(
+                make_integrity_result(),
+                make_suspicious_result(
+                    status="completed_with_errors",
+                    errors=[{"path": "p", "message": "m"}],
+                ),
+            ),
+            "completed_with_errors",
+        )
+
+    def test_both_stages_success_is_still_clean(self):
+        self.assertEqual(
+            derive_overall_status(
+                make_integrity_result(), make_suspicious_result()
+            ),
+            "clean",
+        )
+
+
+class TestIncompleteScanRecording(HashGuardTestCase):
+    """Incomplete scans are recorded with a visible reason, never clean."""
+
+    def test_missing_suspicious_stage_records_incomplete_scan(self):
+        record = log_scan(make_integrity_result())
+        self.assertEqual(record["overall_status"], "incomplete")
+
+        scan = get_scan_by_id(record["scan_id"])
+        self.assertEqual(scan["overall_status"], "incomplete")
+        self.assertIsNone(scan["suspicious_status"])
+
+        events = get_scan_events(record["scan_id"])
+        types = [event["event_type"] for event in events]
+        self.assertIn("scan_incomplete", types)
+        incomplete_event = next(
+            event for event in events
+            if event["event_type"] == "scan_incomplete"
+        )
+        self.assertEqual(incomplete_event["severity"], "high")
+        self.assertIn("did not run", incomplete_event["description"])
+
+    def test_failed_suspicious_stage_records_incomplete_scan(self):
+        suspicious = make_suspicious_result(
+            status="failed",
+            errors=[{"path": "monitored", "message": "detector crashed"}],
+        )
+        record = log_scan(make_integrity_result(), suspicious)
+        self.assertEqual(record["overall_status"], "incomplete")
+
+        events = get_scan_events(record["scan_id"])
+        incomplete_event = next(
+            event for event in events
+            if event["event_type"] == "scan_incomplete"
+        )
+        self.assertIn(
+            "did not complete (status: failed)",
+            incomplete_event["description"],
+        )
+        # the stage's own error is still recorded as a scan_error event
+        error_events = [
+            event for event in events if event["event_type"] == "scan_error"
+        ]
+        self.assertEqual(len(error_events), 1)
+
+
 class TestAppendScanEvent(HashGuardTestCase):
     """append_scan_event() lets the orchestrator record stage failures."""
 

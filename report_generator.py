@@ -8,7 +8,7 @@ easy-to-understand overall assessment.
 Guarantees required by the TRD:
 * A report is generated for EVERY recorded scan attempt, including
   failed ones (FR-17).
-* An unsuccessful scan is never labelled clean (FR-17,
+* An unsuccessful or incomplete scan is never labelled clean (FR-17,
   10.2) – the overall assessment stored by the activity logger is reused,
   it is never re-derived more optimistically.
 * The report is a SNAPSHOT: later alert-status changes never rewrite the
@@ -109,6 +109,24 @@ def _assessment_text(status, integrity_result, suspicious_result):
         return (
             "The scan completed but {} error(s) were reported. The findings "
             "in this report may be incomplete.".format(errors)
+        )
+    if status == "incomplete":
+        return (
+            "The scan did not complete: the integrity check reported "
+            "'{}' and the suspicious-file detection reported '{}'. A scan "
+            "is only clean when both checks complete successfully, so "
+            "this result must not be treated as clean.".format(
+                _status_of(integrity_result), _status_of(suspicious_result)
+            )
+        )
+    if status == "incomplete":
+        return (
+            "The scan did not complete: the integrity check reported "
+            "'{}' and the suspicious-file detection reported '{}'. A scan "
+            "is only clean when both checks complete successfully, so "
+            "this result must not be treated as clean.".format(
+                _status_of(integrity_result), _status_of(suspicious_result)
+            )
         )
     if status == "baseline_unavailable":
         return (

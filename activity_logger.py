@@ -41,6 +41,7 @@ EVENT_TYPES = (
     "suspicious_file",
     "baseline_unavailable",
     "invalid_directory",
+    "scan_incomplete",
     "scan_error",
 )
 
@@ -54,9 +55,17 @@ OVERALL_STATUSES = (
     "clean",
     "findings_detected",
     "completed_with_errors",
+    "incomplete",
     "baseline_unavailable",
     "invalid_directory",
 )
+
+# Statuses that mean a detection stage actually ran and finished.  A
+# scan can only be assessed further (and eventually be marked clean)
+# when BOTH stages report one of these.  Anything else - a missing
+# result, ``not_started``, a stage crash (``failed``) or an unknown
+# status - makes the scan incomplete and it must never appear clean.
+COMPLETED_STAGE_STATUSES = ("success", "completed_with_errors")
 
 
 # ---------------------------------------------------------------------------
@@ -171,9 +180,18 @@ def derive_overall_status(integrity_result, suspicious_result=None):
 
     1. ``invalid_directory``      – integrity checker reports an invalid directory
     2. ``baseline_unavailable``   – integrity checker reports an unavailable baseline
-    3. ``completed_with_errors``  – either module reports errors
-    4. ``findings_detected``      – any change or suspicious finding exists
-    5. ``clean``                  – no findings and no errors
+    3. ``incomplete``             – a required detection stage is missing,
+                                     failed or reported an unknown status
+    4. ``completed_with_errors``  – either module reports errors
+    5. ``findings_detected``      – any change or suspicious finding exists
+    6. ``clean``                  – only when BOTH checks ran and succeeded
+                                     with no findings and no errors
+
+    A scan is marked ``clean`` only when the integrity check AND the
+    suspicious-file detection both ran and completed successfully with
+    no findings and no errors.  A missing suspicious result, a stage
+    that never started, crashed or reported an unknown status yields
+    ``incomplete`` - never a clean result.
     """
     integrity_status = _status(integrity_result)
     suspicious_status = _status(suspicious_result)
@@ -186,7 +204,18 @@ def derive_overall_status(integrity_result, suspicious_result=None):
     if integrity_status == "baseline_unavailable":
         return "baseline_unavailable"
 
-    # 3. errors reported by either module
+    # 3. a required stage is missing, failed or unknown -> the scan did
+    #    not complete.  Like the other failure conditions this outranks
+    #    findings, and it can never be reported as clean.
+    integrity_completed = integrity_status in COMPLETED_STAGE_STATUSES
+    suspicious_completed = (
+        suspicious_result is not None
+        and suspicious_status in COMPLETED_STAGE_STATUSES
+    )
+    if not integrity_completed or not suspicious_completed:
+        return "incomplete"
+
+    # 4. errors reported by either module
     has_errors = (
         _count(integrity_result, "errors") > 0
         or integrity_status == "completed_with_errors"
@@ -202,7 +231,7 @@ def derive_overall_status(integrity_result, suspicious_result=None):
     if has_errors:
         return "completed_with_errors"
 
-    # 4. findings detected
+    # 5. findings detected
     has_findings = (
         _count(integrity_result, "modified") > 0
         or _count(integrity_result, "added") > 0
@@ -220,7 +249,8 @@ def derive_overall_status(integrity_result, suspicious_result=None):
     if has_findings:
         return "findings_detected"
 
-    # 5. clean
+    # 6. clean – only reachable when both stages completed successfully
+    #    (checked in step 3) with no errors and no findings.
     return "clean"
 
 
@@ -270,6 +300,36 @@ def _build_events(integrity_result, suspicious_result, integrity_status,
             "Invalid or unavailable monitoring directory.",
             "medium",
             {"integrity_status": integrity_status},
+        ))
+
+    # A required detection stage is missing, failed or unknown: the scan
+    # did not complete and must not be treated as a clean result.
+    if overall_status == "incomplete":
+        reasons = []
+        if integrity_status not in COMPLETED_STAGE_STATUSES:
+            reasons.append(
+                "the integrity-checking stage did not complete (status: {})".format(
+                    integrity_status or "unknown"
+                )
+            )
+        if suspicious_result is None:
+            reasons.append("the suspicious-file detection stage did not run")
+        elif suspicious_status not in COMPLETED_STAGE_STATUSES:
+            reasons.append(
+                "the suspicious-file detection stage did not complete "
+                "(status: {})".format(suspicious_status or "unknown")
+            )
+        events.append((
+            "scan_incomplete",
+            "system",
+            None,
+            "Scan incomplete: {}. The result must not be treated as "
+            "clean.".format(" and ".join(reasons) or "an unknown failure occurred"),
+            "high",
+            {
+                "integrity_status": integrity_status,
+                "suspicious_status": suspicious_status,
+            },
         ))
 
     # FR-02: integrity findings

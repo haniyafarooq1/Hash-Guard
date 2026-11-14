@@ -104,12 +104,13 @@ python -m pytest tests/ -v          # or: python -m unittest discover -v
 | `tests/test_baseline.py` | Baseline create/load/update, HMAC signature |
 | `tests/test_integrity_checker.py` | Modified/added/deleted/renamed detection, tamper-proof baseline |
 | `tests/test_suspicious_detector.py` | Risky extensions, executable permissions |
-| `tests/test_activity_logger.py` | TRD 11.1 scenarios + assessments, event appending |
-| `tests/test_alerts.py` | TRD 11.2 scenarios + dedupe, filtering, severity config |
+| `tests/test_activity_logger.py` | TRD 11.1 scenarios + assessments, incomplete scans, event appending |
+| `tests/test_alerts.py` | TRD 11.2 scenarios + dedupe, filtering, severity config, pinned baseline severity |
 | `tests/test_report_generator.py` | TRD 11.3 scenarios + snapshots, JSON/PDF export |
+| `tests/test_scan_service.py` | Orchestrator stage isolation (alert/report/detector failures) |
 | `tests/test_pipeline_integration.py` | TRD 11.4 scenarios 1–12 (real detection modules, full pipeline) |
-| `tests/test_api.py` | FastAPI endpoints end-to-end |
-| `tests/test_storage.py` | SQLite connection lifecycle (per-thread isolation) |
+| `tests/test_api.py` | FastAPI endpoints end-to-end incl. path validation |
+| `tests/test_storage.py` | SQLite connection lifecycle (per-thread isolation, cross-thread cleanup) |
 
 All tests use temporary directories and temporary databases; the
 baseline secret key is redirected to a temporary file so the real key is
@@ -131,29 +132,60 @@ never touched.
 | GET | `/api/reports/{scan_id}` | JSON report of a scan |
 | GET | `/api/reports/{scan_id}/export?format=json\|pdf` | Download a report |
 | POST | `/api/scan` | Run a full scan: `{"directory": "...", "baseline_file": "baseline.json"}` |
-| POST | `/api/baseline/create` | Create + sign a baseline for a monitored directory |
+| POST | `/api/baseline/create` | Create + sign a baseline; replacing an existing file requires `"overwrite": true` |
+
+## API path restrictions
+
+The API is not an arbitrary filesystem scanner. Before any request
+reaches the detection modules:
+
+* the monitored directory must exist and lie inside the configured
+  **allowed roots** (symlinks are resolved, so a link cannot escape);
+* the baseline file must be a `.json` file inside the allowed roots;
+* scan requests require an existing baseline;
+* baseline creation refuses to overwrite an existing file unless the
+  request explicitly passes `"overwrite": true`.
+
+Allowed roots come from the `HASHGUARD_ALLOWED_ROOTS` environment
+variable (paths separated by `:` on POSIX / `;` on Windows). By default
+they are the process working directory and the system temporary
+directory.
 
 ## Database
 
 SQLite, stored **outside the monitored directories** so Hash Guard never
 detects its own database: `~/.hash_guard/hashguard.db` by default,
 overridable with the `HASHGUARD_DB` environment variable or
-`database.set_database_path()` (used by the tests).
+`database.set_database_path()` (used by the tests). Parent directories
+of a custom location are created automatically.
 
 Tables: `scans` (one row per scan attempt), `activity_logs` (events),
 `alerts` (with `UNIQUE (scan_id, dedupe_key)` for duplicate prevention),
 `reports` (one snapshot per scan, refreshed in place). Foreign keys are
 enforced on every connection; all queries are parameterized.
 
-Connections are isolated per thread, one cached connection per worker
-thread.
+Connections are isolated per thread; every connection is additionally
+tracked in a process-wide registry so `reset_connections()` can close
+the connections held by worker threads during test teardown (required
+on Windows, where an open handle keeps the file undeletable – WinError
+32).
 
 ## Design decisions
 
-* **Conservative assessment.** The overall assessment follows the FR-19
-  priority `invalid_directory` → `baseline_unavailable` →
-  `completed_with_errors` → `findings_detected` → `clean`. Original
-  statuses are always preserved separately.
+* **No false clean results.** The overall assessment follows the FR-19
+  priority `invalid_directory` → `baseline_unavailable` → `incomplete`
+  → `completed_with_errors` → `findings_detected` → `clean`.
+  `clean` is derived only when the integrity check AND the
+  suspicious-file detection both ran and completed successfully with no
+  findings and no errors. A missing, not-started, crashed or unknown
+  stage yields `incomplete` – never a clean result. Original statuses
+  are always preserved separately.
+* **Stage isolation in the scan orchestrator.** A failure of the alert
+  stage never prevents report generation (and vice versa); an unexpected
+  crash of a detection stage is captured in a synthetic `failed` result
+  so the attempt is still recorded, assessed as `incomplete`; every
+  stage failure is appended to the scan's activity log. Only a failure
+  of the recording stage itself propagates to the caller.
 * **Alert deduplication.** Every alert has a stable `dedupe_key`
   (`modified:<path>`, `suspicious:<path>`, `baseline_unavailable`, …)
   and a `UNIQUE (scan_id, dedupe_key)` constraint, so re-generating
@@ -161,9 +193,13 @@ thread.
   array is the only source of suspicious alerts – the overlapping
   `executable_files` / `newly_added_files` arrays are just
   cross-referenced.
-* **Configurable severities.**
+* **Configurable severities, with a pinned floor.**
   `alerts.set_severity_config({...})` overrides the default severity
-  mapping at runtime; nothing is hard-coded in the frontend.
+  mapping at runtime; nothing is hard-coded in the frontend. The
+  severity of baseline verification / authentication failures is pinned
+  to `critical` and cannot be lowered – changing it raises a
+  `ValueError`, and the alert generation enforces the same floor as
+  defense in depth.
 * **Report snapshots.** Reports are frozen at generation time (changing
   an alert's status later never rewrites history) and re-generation
   replaces the snapshot in place (`ON CONFLICT(scan_id) DO UPDATE`).
@@ -199,8 +235,8 @@ Hash-Guard/
 │
 ├── backend/
 │   ├── main.py                # FastAPI app
-│   ├── api/                   # logs / alerts / reports / scan routers
-│   ├── services/scan_service.py   # scan orchestrator
+│   ├── api/                   # logs / alerts / reports / scan routers + path rules
+│   ├── services/scan_service.py   # scan orchestrator (stage isolation)
 │   └── storage/database.py    # SQLite schema + connection lifecycle
 │
 ├── frontend/                  # Vite + React + Tailwind

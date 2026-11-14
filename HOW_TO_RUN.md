@@ -39,7 +39,7 @@ pip install -r requirements.txt
 python3 -m pytest tests/ -v
 ```
 
-Expected result: **104 passed** (takes ~2 seconds).
+Expected result: **139 passed** (takes ~2 seconds).
 
 Test files and what they cover:
 
@@ -48,19 +48,20 @@ Test files and what they cover:
 | `tests/test_baseline.py` | Baseline create/load/update, HMAC signature |
 | `tests/test_integrity_checker.py` | Modified/added/deleted/renamed detection, tamper-proof baseline |
 | `tests/test_suspicious_detector.py` | `.exe`/`.bat`/`.ps1` flagging, executable permissions |
-| `tests/test_activity_logger.py` | Scan history, per-scan events, activity-log filters |
-| `tests/test_alerts.py` | Alert generation, severity, status workflow |
+| `tests/test_activity_logger.py` | Scan history, per-scan events, activity-log filters, incomplete-scan assessment |
+| `tests/test_alerts.py` | Alert generation, severity, status workflow, pinned baseline severity |
 | `tests/test_report_generator.py` | Report snapshot, JSON & PDF export |
+| `tests/test_scan_service.py` | Orchestrator stage isolation (alert/report/detector failures) |
 | `tests/test_pipeline_integration.py` | Full pipeline + failure conditions + persistence across restart |
-| `tests/test_api.py` | FastAPI endpoints end-to-end |
-| `tests/test_storage.py` | SQLite connection lifecycle (per-thread isolation) |
+| `tests/test_api.py` | FastAPI endpoints end-to-end incl. path validation |
+| `tests/test_storage.py` | SQLite connection lifecycle (per-thread isolation, cross-thread cleanup) |
 
 To run one area only:
 
 ```bash
 python3 -m pytest tests/test_baseline.py tests/test_integrity_checker.py tests/test_suspicious_detector.py -v   # detection units
 python3 -m pytest tests/test_activity_logger.py tests/test_alerts.py tests/test_report_generator.py -v          # logging/alerts/reports units
-python3 -m pytest tests/test_pipeline_integration.py -v                                                          # integration
+python3 -m pytest tests/test_scan_service.py tests/test_pipeline_integration.py -v                              # integration
 python3 -m pytest tests/test_api.py tests/test_storage.py -v                                                    # API + storage
 ```
 
@@ -87,7 +88,8 @@ The signed baseline is stored as `baseline.json` + `baseline.json.sig`
 python3 -m uvicorn backend.main:app --reload --port 8000
 ```
 
-- The SQLite database is created automatically at `~/.hash_guard/hashguard.db`.
+- The SQLite database is created automatically at `~/.hash_guard/hashguard.db`
+  (missing parent directories of a custom `HASHGUARD_DB` location are created).
 - Interactive API documentation (Swagger UI): **http://localhost:8000/docs**
 
 ### 3a. Try a complete scan from the command line
@@ -122,16 +124,37 @@ Expected response (abridged):
   "integrity_summary": { "modified": 1, "added": 0, "deleted": 1, ... },
   "suspicious_summary": { "suspicious_files": 1, "executable_files": 1, ... },
   "alerts_generated": 2,
-  "report_id": 1
+  "report_id": 1,
+  "stage_failures": []
 }
 ```
 
-### 3b. API endpoint cheat-sheet
+`stage_failures` lists any workflow stage that failed unexpectedly
+(e.g. `alert_generation`); such scans can never be assessed `clean`.
+
+### 3b. API path restrictions
+
+The API only scans directories and stores baselines **inside the
+allowed roots**. By default these are the working directory (project
+root) and the system temp directory. Extend them with an environment
+variable (paths separated by `:` on POSIX, `;` on Windows):
+
+```bash
+HASHGUARD_ALLOWED_ROOTS="/home/me/monitored:/srv/data" uvicorn backend.main:app --port 8000
+```
+
+Rules: monitored directory must exist and be inside the allowed roots
+(symlinks cannot escape); baseline files must be `.json` and inside the
+allowed roots; `/api/scan` requires an existing baseline (404
+otherwise); `/api/baseline/create` refuses to overwrite an existing
+baseline without `"overwrite": true` (409 otherwise).
+
+### 3c. API endpoint cheat-sheet
 
 | Method | Endpoint | Purpose |
 |--------|----------|---------|
 | GET  | `/api/health` | Liveness check |
-| POST | `/api/baseline/create` | Create + HMAC-sign a baseline |
+| POST | `/api/baseline/create` | Create + HMAC-sign a baseline (`"overwrite": true` to replace) |
 | POST | `/api/scan` | Full orchestrated scan |
 | GET  | `/api/scans?limit=50` | Scan history |
 | GET  | `/api/scans/{scan_id}` | One scan with its events + alerts |
@@ -156,13 +179,14 @@ curl -X PATCH http://localhost:8000/api/alerts/1/status \
 curl "http://localhost:8000/api/reports/1/export?format=pdf" -o report.pdf
 ```
 
-### 3c. Scan status meanings
+### 3d. Scan status meanings
 
 | Status | Meaning |
 |--------|---------|
 | `clean` | Both the integrity check and the suspicious-file detection ran successfully: no changes, no suspicious files, no errors |
 | `findings_detected` | Changes or suspicious files were found (both stages completed) |
 | `completed_with_errors` | Both stages completed, but per-file errors were reported |
+| `incomplete` | At least one required stage is missing, crashed or reported an unknown status — never treated as clean |
 | `baseline_unavailable` | The baseline could not be loaded or authenticated (critical alert) |
 | `invalid_directory` | The monitored directory is invalid or unavailable |
 
@@ -188,7 +212,7 @@ in `frontend/.env` to point somewhere else.)
 
 | Page (route) | What you should see |
 |--------------|---------------------|
-| **Dashboard** (`/`) | Latest scan status, alert counters, baseline creation and "run scan" forms |
+| **Dashboard** (`/`) | Latest scan status, alert counters, baseline creation (with "Replace existing baseline file" option) and "run scan" forms |
 | **Activity Logs** (`/logs`) | Every file event of every scan (modified / added / deleted / renamed / suspicious / scan errors), filterable by type, severity and date; click a scan to see its timeline |
 | **Alerts** (`/alerts`) | Alert cards with severity badges; mark as read / dismissed; summary counters |
 | **Reports** (`/reports`) | One report per scan; open a report for full details; download JSON / PDF |
@@ -229,6 +253,8 @@ To start with a clean database: `rm ~/.hash_guard/hashguard.db`
 | `ModuleNotFoundError: baseline` when running tests | Run `pytest` from the project root, not from inside `tests/` |
 | `uvicorn: command not found` | Use `python3 -m uvicorn ...` |
 | Frontend shows "Failed to fetch" | Backend is not running — start uvicorn on port 8000 first |
+| API answers 403 "outside the allowed roots" | Add your monitored folder to `HASHGUARD_ALLOWED_ROOTS` (see §3b) |
+| API answers 409 on baseline creation | The baseline file exists; tick "Replace existing baseline file" (UI) or send `"overwrite": true` |
 | Port 8000 already in use | `uvicorn backend.main:app --port 8001` (the Vite proxy targets 8000 by default; change it in `frontend/vite.config.js` if needed) |
 | `npm run dev` fails after pulling | Delete `frontend/node_modules` and run `npm install` again |
 | Alerts from old experiments keep showing | Delete `~/.hash_guard/hashguard.db` and restart the API |

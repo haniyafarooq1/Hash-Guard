@@ -347,7 +347,8 @@ class TestFailureConditions(PipelineIntegrationTestCase):
 
         # Point the storage layer at an impossible location: the
         # configured database path is a DIRECTORY, so SQLite can never
-        # open a connection there.
+        # open a connection there (missing parent directories, by
+        # contrast, are created automatically nowadays).
         database.reset_connections()
         database.set_database_path(str(self.root))
 

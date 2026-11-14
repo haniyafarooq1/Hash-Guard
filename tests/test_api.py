@@ -5,12 +5,17 @@ HTTP layer (FastAPI TestClient), using a temporary database, a temporary
 monitored directory and a temporary baseline secret key.
 """
 
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
 import baseline_security
 from fastapi.testclient import TestClient
 
+from backend.api import path_rules
 from backend.main import app
+from backend.storage import database
 from tests.test_helpers import HashGuardTestCase
 
 
@@ -278,6 +283,179 @@ class TestHealth(ApiTestCase):
         health = self.client.get("/api/health")
         self.assertEqual(health.status_code, 200)
         self.assertEqual(health.json()["status"], "ok")
+
+
+class TestPathValidation(ApiTestCase):
+    """The API must not become an arbitrary filesystem scanner.
+
+    Directories and baseline files are restricted to the configured
+    allowed roots, baseline files must be .json, scans require an
+    existing baseline, and overwriting a baseline is opt-in only.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Restrict the API to this test's temporary root only, so the
+        # outside-roots cases below are deterministic.
+        path_rules.set_allowed_roots([self.root])
+
+    def tearDown(self):
+        path_rules.reset_allowed_roots()
+        super().tearDown()
+
+    def test_scan_directory_outside_allowed_roots_is_forbidden(self):
+        with tempfile.TemporaryDirectory() as outside:
+            response = self.client.post(
+                "/api/scan",
+                json={
+                    "directory": outside,
+                    "baseline_file": str(self.baseline_file),
+                },
+            )
+            self.assertEqual(response.status_code, 403)
+            self.assertIn("outside the allowed roots",
+                          response.json()["detail"])
+
+    def test_scan_nonexistent_directory_is_rejected(self):
+        response = self.client.post(
+            "/api/scan",
+            json={
+                "directory": str(self.root / "does_not_exist"),
+                "baseline_file": str(self.baseline_file),
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_scan_file_as_directory_is_rejected(self):
+        target = self.root / "plain.txt"
+        target.write_text("a file, not a directory")
+        response = self.client.post(
+            "/api/scan",
+            json={
+                "directory": str(target),
+                "baseline_file": str(self.baseline_file),
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_scan_with_missing_baseline_is_rejected(self):
+        response = self.client.post(
+            "/api/scan",
+            json={
+                "directory": str(self.monitored),
+                "baseline_file": str(self.root / "absent_baseline.json"),
+            },
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("Baseline file not found", response.json()["detail"])
+
+    def test_scan_with_non_json_baseline_is_rejected(self):
+        bogus = self.root / "baseline.txt"
+        bogus.write_text("not a baseline")
+        response = self.client.post(
+            "/api/scan",
+            json={
+                "directory": str(self.monitored),
+                "baseline_file": str(bogus),
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_scan_baseline_outside_allowed_roots_is_forbidden(self):
+        with tempfile.TemporaryDirectory() as outside:
+            baseline = Path(outside) / "baseline.json"
+            baseline.write_text("{}")
+            response = self.client.post(
+                "/api/scan",
+                json={
+                    "directory": str(self.monitored),
+                    "baseline_file": str(baseline),
+                },
+            )
+            self.assertEqual(response.status_code, 403)
+
+    def test_baseline_creation_outside_allowed_roots_is_forbidden(self):
+        with tempfile.TemporaryDirectory() as outside:
+            response = self.client.post(
+                "/api/baseline/create",
+                json={
+                    "directory": str(self.monitored),
+                    "baseline_file": str(Path(outside) / "baseline.json"),
+                },
+            )
+            self.assertEqual(response.status_code, 403)
+
+    def test_baseline_creation_requires_explicit_overwrite(self):
+        # first creation succeeds
+        first = self.client.post(
+            "/api/baseline/create",
+            json={
+                "directory": str(self.monitored),
+                "baseline_file": str(self.baseline_file),
+            },
+        )
+        self.assertEqual(first.status_code, 200)
+
+        # second creation without the overwrite flag -> 409, the
+        # existing baseline stays untouched
+        conflict = self.client.post(
+            "/api/baseline/create",
+            json={
+                "directory": str(self.monitored),
+                "baseline_file": str(self.baseline_file),
+            },
+        )
+        self.assertEqual(conflict.status_code, 409)
+        self.assertIn("overwrite", conflict.json()["detail"])
+
+        # explicit overwrite succeeds
+        replaced = self.client.post(
+            "/api/baseline/create",
+            json={
+                "directory": str(self.monitored),
+                "baseline_file": str(self.baseline_file),
+                "overwrite": True,
+            },
+        )
+        self.assertEqual(replaced.status_code, 200)
+        self.assertTrue(replaced.json()["success"])
+
+    def test_baseline_creation_for_non_json_target_is_rejected(self):
+        response = self.client.post(
+            "/api/baseline/create",
+            json={
+                "directory": str(self.monitored),
+                "baseline_file": str(self.root / "baseline.sqlite"),
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_symlink_escaping_allowed_roots_is_rejected(self):
+        try:
+            with tempfile.TemporaryDirectory() as outside:
+                link = self.root / "escape_link"
+                os.symlink(outside, link)
+                try:
+                    response = self.client.post(
+                        "/api/scan",
+                        json={
+                            "directory": str(link),
+                            "baseline_file": str(self.baseline_file),
+                        },
+                    )
+                    self.assertEqual(response.status_code, 403)
+                finally:
+                    link.unlink()
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available on this platform")
+
+    def test_valid_paths_inside_allowed_roots_still_work(self):
+        self.create_baseline()
+        (self.monitored / "notes.txt").write_text("Changed")
+        response = self.run_scan()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["overall_status"],
+                         "findings_detected")
 
 
 if __name__ == "__main__":

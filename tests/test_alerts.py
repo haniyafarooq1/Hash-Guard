@@ -22,6 +22,7 @@ from activity_logger import log_scan
 from alerts import (
     generate_alerts,
     get_alert_by_id,
+    get_severity_config,
     get_alert_summary,
     get_alerts,
     reset_severity_config,
@@ -417,6 +418,73 @@ class TestStatusManagementAndFiltering(HashGuardTestCase):
             scan_id,
         )
         self.assertEqual(alerts[0]["timestamp"], "2026-11-07T12:00:00+05:00")
+
+
+class TestBaselineSeverityIsPinnedCritical(HashGuardTestCase):
+    """Baseline verification failures must always stay CRITICAL (FR-09).
+
+    The runtime severity configuration may tune other rules, but it can
+    never lower (or otherwise change) the severity of a baseline
+    verification / authentication failure.
+    """
+
+    def make_baseline_failure(self):
+        integrity = make_integrity_result(
+            status="baseline_unavailable",
+            errors=[{
+                "path": "/tmp/baseline.json",
+                "message": "Baseline unavailable or authentication failed.",
+            }],
+        )
+        scan_id = log_scan(integrity, make_suspicious_result())["scan_id"]
+        return generate_alerts(integrity, make_suspicious_result(), scan_id)
+
+    def test_lowering_the_baseline_severity_is_rejected(self):
+        for forbidden in ("low", "medium", "high", "info"):
+            with self.assertRaises(ValueError):
+                set_severity_config(
+                    {"baseline_unavailable": forbidden}
+                )
+        # nothing was changed:
+        self.assertEqual(
+            get_severity_config()["baseline_unavailable"], "critical"
+        )
+
+    def test_raising_or_reasserting_is_only_accepted_as_critical(self):
+        # already critical: re-asserting the pinned value is accepted
+        set_severity_config({"baseline_unavailable": "critical"})
+        self.assertEqual(
+            get_severity_config()["baseline_unavailable"], "critical"
+        )
+
+    def test_baseline_alert_stays_critical_despite_other_overrides(self):
+        set_severity_config({
+            "file_modified": "low",
+            "suspicious_executable": "info",
+        })
+        alerts = self.make_baseline_failure()
+        baseline_alerts = [
+            a for a in alerts if a["dedupe_key"] == "baseline_unavailable"
+        ]
+        self.assertEqual(len(baseline_alerts), 1)
+        self.assertEqual(baseline_alerts[0]["severity"], "critical")
+        self.assertEqual(baseline_alerts[0]["category"], "baseline")
+
+    def test_generation_enforces_the_pinned_floor(self):
+        """Defense in depth: even a corrupted in-memory config cannot
+        lower the severity actually used for the alert."""
+        import alerts as alerts_module
+        try:
+            alerts_module._severity_config["baseline_unavailable"] = "low"
+            alerts_list = self.make_baseline_failure()
+            baseline_alerts = [
+                a for a in alerts_list
+                if a["dedupe_key"] == "baseline_unavailable"
+            ]
+            self.assertEqual(len(baseline_alerts), 1)
+            self.assertEqual(baseline_alerts[0]["severity"], "critical")
+        finally:
+            reset_severity_config()
 
 
 if __name__ == "__main__":
